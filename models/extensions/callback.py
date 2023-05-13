@@ -3,7 +3,7 @@ import traceback
 from queue import Queue
 from threading import Thread
 import threading
-
+from typing import Optional, List, Dict, Any
 from collections import deque
 import torch
 import transformers
@@ -12,7 +12,41 @@ from models.extensions.thread_with_exception import ThreadWithException
 import models.shared as shared
 
 
+class LimitedLengthDict(dict):
+    def __init__(self, maxlen=None, *args, **kwargs):
+        self.maxlen = maxlen
+        self._keys = deque()
+        super().__init__(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        if key not in self:
+            if self.maxlen is not None and len(self) >= self.maxlen:
+                oldest_key = self._keys.popleft()
+                if oldest_key in self:
+                    del self[oldest_key]
+        self._keys.append(key)
+        super().__setitem__(key, value)
+
+
 class FixedLengthQueue:
+
+    # 停止符号列表
+    stop_sequence: Optional[str] = []
+    # 缓冲区
+    max_length: int = 0
+    # 缓冲区容器
+    queue: deque = None
+    # 输入区容器
+    queue_in: LimitedLengthDict[int, str] = {}
+    # 输出区容器
+    queue_out: Dict[int, str] = {}
+
+    def __new__(cls, *args, **kwargs):
+        # 创建新的实例
+        instance = super().__new__(cls)
+        # 在这里可以对实例进行额外的设置
+        return instance
+
     def __init__(self, stop_sequence):
         if stop_sequence is None:
             self.stop_sequence = []
@@ -25,12 +59,49 @@ class FixedLengthQueue:
             self.max_length = len(''.join(stop_sequence))
 
         self.queue = deque(maxlen=self.max_length)
+        self.queue.clear()
+        self.queue_in.clear()
+        self.queue_out.clear()
 
-    def add(self, item):
-        for char in item:
-            self.queue.append(char)
+    def add(self, index, item):
+        self.queue_in[index] = item
+
+    def _add_out(self, index, item):
+        self.queue_out[index] = item
+
+    def put_replace_out(self, index):
+        return self.queue_out[index]
+
+    def contains_replace_sequence(self):
+        """
+        替换字符
+        :return:
+        """
+
+        for key, value in self.queue_in.items():
+
+            word_index = value.rfind("：")
+            if word_index != -1:
+                value = value.replace("：", ":")
+
+            word_index = value.rfind("[")
+            if word_index != -1:
+                value = value.replace("[", "")
+
+            word_index = value.rfind("]")
+            if word_index != -1:
+                value = value.replace("]", "")
+
+            self._add_out(key, value)
 
     def contains_stop_sequence(self):
+        # 截取固定大小的数据判断
+        self.queue.clear()
+        last_three_keys = list(self.queue_out.keys())[-self.max_length:]
+        joined_queue = ''.join([self.queue_out[key] for key in last_three_keys])
+        for char in joined_queue:
+            self.queue.append(char)
+
         joined_queue = ''.join(self.queue)
         # Initialize a variable to store the index of the last found stop string
         last_stop_str_index = -1
@@ -89,16 +160,24 @@ class Iteratorize:
     into a lazy iterator (generator).
     """
 
+    thread: ThreadWithException = None
+
+    def __new__(cls, *args, **kwargs):
+        # 创建新的实例
+        instance = super().__new__(cls)
+        # 在这里可以对实例进行额外的设置
+        return instance
+
+
     def __init__(self, func, kwargs={}, callback=None):
         self.mfunc = func
         self.c_callback = callback
         self.q = Queue()
         self.sentinel = object()
         self.kwargs = kwargs
-        self.stop_now = False
 
         def _callback(val):
-            if self.stop_now:
+            if shared.stop_everything:
                 raise ValueError
             self.q.put(val)
 
@@ -106,32 +185,41 @@ class Iteratorize:
             try:
                 ret = self.mfunc(callback=_callback, **self.kwargs)
             except ValueError:
-                pass
+                print("print(ValueError)")
+                self.q.put(self.sentinel)
             except:
                 traceback.print_exc()
-                pass
-
+                print("traceback.print_exc()")
+                self.q.put(self.sentinel)
             self.q.put(self.sentinel)
+            self.thread.raise_exception()
 
-        self.thread = Thread(target=gen)
+        self.thread = ThreadWithException(target=gen)
         self.thread.start()
 
     def __iter__(self):
+        shared.stop_everything = False
         return self
 
     def __next__(self):
         obj = self.q.get(True, None)
         if obj is self.sentinel:
             raise StopIteration
+        if shared.stop_everything:
+            raise StopIteration
         else:
             return obj
 
     def __del__(self):
+        shared.stop_everything = False
+        self.q.empty()
         shared.loaderCheckPoint.clear_torch_cache()
 
     def __enter__(self):
+        shared.stop_everything = False
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop_now = True
+        shared.stop_everything = True
         shared.loaderCheckPoint.clear_torch_cache()
+        self.thread.raise_exception()

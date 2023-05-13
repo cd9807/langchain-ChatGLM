@@ -45,12 +45,12 @@ class LLamaLLM(BaseAnswer, LLM, ABC):
     checkPoint: LoaderCheckPoint = None
     history = []
     history_len: int = 3
-    max_new_tokens: int = 256
+    max_new_tokens: int = 500
     num_beams: int = 1
-    temperature: float = 0.7
-    top_p: float = 0.1
+    temperature: float = 0.5
+    top_p: float = 0.4
     top_k: int = 10
-    repetition_penalty: float = 6.1
+    repetition_penalty: float = 1.12
     encoder_repetition_penalty: int = 1
     min_length: int = 0
     logits_processor: LogitsProcessorList = None
@@ -107,11 +107,12 @@ class LLamaLLM(BaseAnswer, LLM, ABC):
         reply = self.checkPoint.tokenizer.decode(output_ids, skip_special_tokens=True)
         return reply
 
-    def generate_with_callback(self,callback=None, **kwargs):
+    def generate_with_callback(self, callback=None, **kwargs):
         self.checkPoint.clear_torch_cache()
         kwargs['stopping_criteria'].append(Stream(callback_func=callback))
         with torch.no_grad():
             self.checkPoint.model.generate(**kwargs)
+            print("方法结束")
 
     def generate_with_streaming(self, **kwargs):
         return Iteratorize(self.generate_with_callback, kwargs)
@@ -196,32 +197,30 @@ class LLamaLLM(BaseAnswer, LLM, ABC):
         # 对话内容
         # 处理历史对话
         formatted_history = self.history_to_text(query)
-        # 将历史对话向量与当前对话向量拼接
-        filler_input_ids = self.encode(formatted_history, add_bos_token=self.state['add_bos_token'],
-                                       truncation_length=self.max_new_tokens)
-        return filler_input_ids
+        return formatted_history
 
     def _call(self,
               prompt: str,
               stop: Optional[List[str]] = None,
               run_manager: Optional[CallbackManagerForLLMRun] = None) -> str:
-
+        print(f"__call:{prompt}")
         if self.logits_processor is None:
             self.logits_processor = LogitsProcessorList()
         self.logits_processor.append(InvalidScoreLogitsProcessor())
 
         gen_kwargs = {
-                      "max_new_tokens": self.max_new_tokens,
-                      "num_beams": self.num_beams,
-                      "top_p": self.top_p,
-                      "top_k": self.top_k,
-                      "repetition_penalty": self.repetition_penalty,
-                      "encoder_repetition_penalty": self.encoder_repetition_penalty,
-                      "min_length": self.min_length,
-                      "temperature": self.temperature,
-                      "logits_processor": self.logits_processor}
+            "max_new_tokens": self.max_new_tokens,
+            "num_beams": self.num_beams,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repetition_penalty": self.repetition_penalty,
+            "encoder_repetition_penalty": self.encoder_repetition_penalty,
+            "min_length": self.min_length,
+            "temperature": self.temperature,
+            "logits_processor": self.logits_processor}
 
-        input_ids = self.generate_softprompt_history_tensors(prompt)
+        #  向量拼接
+        input_ids = self.encode(prompt, add_bos_token=self.state['add_bos_token'], truncation_length=self.max_new_tokens)
         # input_ids, position_ids, attention_mask = self.prepare_inputs_for_generation(input_ids=filler_input_ids)
 
         # 对话模型prompt
@@ -229,40 +228,47 @@ class LLamaLLM(BaseAnswer, LLM, ABC):
         # 注意力掩码
         # gen_kwargs.update({'attention_mask': attention_mask})
         # gen_kwargs.update({'position_ids': position_ids})
+        if self.stopping_criteria is None:
+            self.stopping_criteria = transformers.StoppingCriteriaList()
         # 观测输出
-        gen_kwargs.update({'stopping_criteria':  self.stopping_criteria})
+        gen_kwargs.update({'stopping_criteria': self.stopping_criteria})
         shared.stop_everything = False
         stopped = False
         response_template = _streaming_response_template()
-        with self.generate_with_streaming(**gen_kwargs) as generator:
-            last_reply_index = 0
-            # Create a FixedLengthQueue with the desired stop sequence and a maximum length.
-            if stop:
-                queue = FixedLengthQueue(stop)
 
+        # TODO 此流输出方法需要重写！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！
+        # stopping_criteria方法不可控制 迭代器的变量无法共享
+        with self.generate_with_streaming(**gen_kwargs) as generator:
+            last_reply_len = 0
+            reply_index = 0
+            # Create a FixedLengthQueue with the desired stop sequence and a maximum length.
+            queue = FixedLengthQueue(stop)
             for output in generator:
                 new_tokens = len(output) - len(input_ids[0])
                 reply = self.decode(output[-new_tokens:])
 
-                new_reply = len(reply) - last_reply_index
+                new_reply = len(reply) - last_reply_len
                 output_reply = reply[-new_reply:]
+                queue.add(reply_index, output_reply)
+                queue.contains_replace_sequence()
+                if stop:
+                    pos = queue.contains_stop_sequence()
+                    if pos != -1:
+                        shared.stop_everything = True
+                        stopped = True
 
-                if last_reply_index > 0:
-                    if stop:
-                        queue.add(output_reply)
-                        pos = queue.contains_stop_sequence()
-                        if pos != -1:
-                            shared.stop_everything = True
-                            stopped = True
+                #print(f"{reply_index}：reply  {output_reply}")
+                english_reply = queue.put_replace_out(reply_index)
+                #print(f"{reply_index}：english_reply  {english_reply}")
+                _update_response(response_template, english_reply)
+                last_reply_len = len(reply)
+
+                reply_index += 1
                 if new_tokens == self.max_new_tokens - 1 or stopped:
-                    break
-                _update_response(response_template, output_reply)
-                last_reply_index = len(reply)
-                if stopped:
                     break
 
         response = response_template['text']
-
+        print(f"response:{response}")
         self.history = self.history + [[None, response]]
         return response
 
@@ -278,7 +284,8 @@ class LLamaLLM(BaseAnswer, LLM, ABC):
         listenerQueue = AnswerResultQueueSentinelTokenListenerQueue()
         self.stopping_criteria.append(listenerQueue)
         # TODO 需要实现chat对话模块和注意力模型，目前_call为langchain的LLM拓展的api，默认为无提示词模式，如果需要操作注意力模型，可以参考chat_glm的实现
-        response = self._call(prompt=prompt, stop=['\n###'])
+        softprompt = self.generate_softprompt_history_tensors(prompt)
+        response = self._call(prompt=softprompt, stop=['\n###'])
         answer_result = AnswerResult()
         answer_result.history = self.history
         if listenerQueue.listenerQueue.__len__() > 0:
